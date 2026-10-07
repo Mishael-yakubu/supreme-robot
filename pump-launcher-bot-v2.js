@@ -66,9 +66,9 @@ const CFG = {
 
   // ---- SNIPING OTHER LAUNCHES (OFF) ----
   snipeOthers: false,
-  minDevBuySol: 0.1,
+  minDevBuySol: 1,
   maxDevBuySol: 10,
-  buySol: 0.1,
+  buySol: 0.05,
   snipeTakeProfitPct: 50,
   snipeStopLossPct: 25,
   snipeMaxHoldSec: 180,
