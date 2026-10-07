@@ -1,11 +1,14 @@
 // bot.js - pump.fun launcher bot (live execution)
 //
 // What it does
-//   - You start each launch from Telegram. The bot creates the token with a dev buy,
-//     then sells 100% automatically the moment your profit target is reached.
+//   - You start each launch from Telegram (or turn on /autopilot for a list).
+//     The bot creates the token with a dev buy, then sells 100% automatically
+//     the moment your profit target is reached.
 //   - It also manages tokens you launch yourself from this same wallet on pump.fun.
 //   - Open positions and your names list are saved (Supabase, or local files if
 //     Supabase is not configured) and restored after a restart.
+//   - /autopilot on advances the /names queue at autoIntervalSec while previous
+//     coins keep selling on their own rules (no manual /next needed).
 //
 // Telegram commands (only TG_CHAT_ID is accepted)
 //   /launch [Name SYMBOL] [image-url]   (attach a photo to use it as the image)
@@ -14,6 +17,7 @@
 //   /list  /next [n]  /clearnames
 //   /addimages  (then public image links, one per line)  /images  /clearimages
 //   /image off                          clear the default image
+//   /autopilot on|off                   auto-advance the names list at intervals
 //   /status  /balance  /sellall  /help
 //
 // Env vars
@@ -24,6 +28,9 @@
 //   SUPABASE_URL          optional, e.g. https://xxxx.supabase.co
 //   SUPABASE_SERVICE_KEY  optional, server-side secret key (never commit it)
 //   SNIPE_OTHERS          optional, set to true to turn on sniping other launches (off by default)
+//   AUTO_PILOT            optional, set to true to start auto-pilot on boot (still needs a /names list)
+//   AUTO_INTERVAL_SEC     optional, seconds between auto launches (default 90)
+//   AUTO_MAX_CONCURRENT   optional, soft open-position limit while auto-pilot runs (default 5)
 //
 // Setup: npm install   |   Run: npm start   |   Self-test: npm test
 
@@ -81,6 +88,14 @@ const CFG = {
   maxLaunchesPerRun: 3,
   launchCooldownSec: 60,
 
+  // ---- auto-pilot (list mode) ----
+  // When on, the bot pulls the next unused name from the /names queue automatically.
+  // Sells of previous tokens continue independently; only one create runs at a time.
+  // Override via env: AUTO_PILOT, AUTO_INTERVAL_SEC, AUTO_MAX_CONCURRENT
+  autoPilot: process.env.AUTO_PILOT === 'true',
+  autoIntervalSec: Math.max(1, Number(process.env.AUTO_INTERVAL_SEC) || 90),
+  autoMaxConcurrent: Math.max(1, Number(process.env.AUTO_MAX_CONCURRENT) || 5),
+
   // ---- sell rules for your launches ----
   devTakeProfitPct: 50,   // total fees are roughly 3% round trip, keep this well above that
   devStopLossPct: 35,     // 0 = disabled
@@ -115,6 +130,8 @@ let shuttingDown = false;
 let storeWarned = false;
 let queue = []; // names list: [{ name, symbol, used }]
 let images = []; // image links added from Telegram
+let autoPilot = false; // runtime flag; seeded from CFG.autoPilot after state load
+let autoTimer = null;
 
 const positions = new Map(); // mint -> position
 const pending = new Set();   // snipe buys in flight
@@ -284,6 +301,64 @@ function parseNames(lines) {
     out.push({ ...ns, used: false });
   }
   return out;
+}
+
+// ---------- auto-pilot ----------
+
+async function tryAutoNext() {
+  if (!autoPilot || shuttingDown || launching) return;
+  if (launches >= CFG.maxLaunchesPerRun) {
+    stopAutoPilot();
+    tg(`Auto-pilot stopped: launch cap reached (${CFG.maxLaunchesPerRun} per run). Restart or raise maxLaunchesPerRun.`);
+    return;
+  }
+
+  const idx = queue.findIndex((q) => !q.used);
+  if (idx === -1) {
+    stopAutoPilot();
+    tg('Auto-pilot finished: no more unused names in the list.');
+    return;
+  }
+
+  // respect existing cooldown
+  const wait = CFG.launchCooldownSec - (now() - lastLaunchAt) / 1000;
+  if (lastLaunchAt && wait > 0) return;
+
+  // soft concurrent-open limit
+  const open = [...positions.values()].filter((p) => !p.closing && !p.launching).length;
+  if (open >= (CFG.autoMaxConcurrent || 999)) return;
+
+  const entry = queue[idx];
+  try {
+    const ok = await launchToken({ name: entry.name, symbol: entry.symbol });
+    if (ok) {
+      entry.used = true;
+      await persistNames();
+      tg(`Auto-pilot launched ${entry.symbol} (${idx + 1}/${queue.length}) — remaining unused: ${queue.filter((q) => !q.used).length}`);
+    }
+  } catch (e) {
+    console.log('[auto] launch error:', e.message);
+    tg(`Auto-pilot launch failed for ${entry.symbol}: ${e.message}`);
+  }
+}
+
+function startAutoPilot() {
+  if (autoTimer) return;
+  autoPilot = true;
+  const intervalMs = Math.max((CFG.autoIntervalSec || CFG.launchCooldownSec), CFG.launchCooldownSec) * 1000;
+  autoTimer = setInterval(() => {
+    tryAutoNext().catch((e) => console.log('[auto]', e.message));
+  }, intervalMs);
+  // fire once soon so the first coin starts without waiting a full interval
+  setTimeout(() => tryAutoNext().catch(() => {}), 1500);
+}
+
+function stopAutoPilot() {
+  if (autoTimer) {
+    clearInterval(autoTimer);
+    autoTimer = null;
+  }
+  autoPilot = false;
 }
 
 // ---------- images ----------
@@ -484,7 +559,7 @@ async function handleCommand(text, photoId) {
       }
       queue = items;
       await persistNames();
-      return tg(`Saved ${queue.length} names. Use /next to launch the next one, /list to view.`);
+      return tg(`Saved ${queue.length} names. Use /next or /autopilot on to launch. /list to view.`);
     }
 
     case '/list': {
@@ -492,10 +567,39 @@ async function handleCommand(text, photoId) {
       return tg(queue.map((q, i) => `${i + 1}. ${q.name} (${q.symbol})${q.used ? ' [done]' : ''}`).join('\n'));
     }
 
-    case '/clearnames':
+    case '/clearnames': {
       queue = [];
       await persistNames();
-      return tg('Names list cleared');
+      const wasAuto = autoPilot;
+      if (wasAuto) stopAutoPilot();
+      return tg('Names list cleared' + (wasAuto ? ' (auto-pilot stopped)' : ''));
+    }
+
+    case '/autopilot': {
+      const arg = (args[0] || '').toLowerCase();
+      if (arg === 'on' || arg === 'start') {
+        if (!queue.length) return tg('Load a list with /names first.');
+        const remaining = queue.filter((q) => !q.used).length;
+        if (!remaining) return tg('All names in the list are already used. Load a fresh list with /names.');
+        startAutoPilot();
+        return tg(
+          `Auto-pilot ON\ninterval ${Math.max(CFG.autoIntervalSec || CFG.launchCooldownSec, CFG.launchCooldownSec)}s\n` +
+            `remaining unused: ${remaining}\nmax concurrent open: ${CFG.autoMaxConcurrent}\n` +
+            `session launch cap: ${CFG.maxLaunchesPerRun}`
+        );
+      }
+      if (arg === 'off' || arg === 'stop') {
+        const was = autoPilot;
+        stopAutoPilot();
+        return tg(was ? 'Auto-pilot OFF.' : 'Auto-pilot was already off.');
+      }
+      const remaining = queue.filter((q) => !q.used).length;
+      return tg(
+        `Auto-pilot is ${autoPilot ? 'ON' : 'OFF'}\n` +
+          `remaining unused: ${remaining} | launches this run: ${launches}/${CFG.maxLaunchesPerRun}\n` +
+          `Use /autopilot on  or  /autopilot off`
+      );
+    }
 
     case '/next': {
       if (!queue.length) return tg('Names list is empty. Use /names to load it.');
@@ -521,13 +625,16 @@ async function handleCommand(text, photoId) {
     }
 
     case '/status': {
-      if (!positions.size) return tg('No open positions');
+      const remaining = queue.filter((q) => !q.used).length;
+      const header =
+        `Auto-pilot: ${autoPilot ? 'ON' : 'OFF'} | launches ${launches}/${CFG.maxLaunchesPerRun} | names left ${remaining}\n`;
+      if (!positions.size) return tg(header + 'No open positions');
       const out = [...positions.values()].map((p) => {
         const chg = p.entryMc ? ((p.lastMc / p.entryMc - 1) * 100).toFixed(1) + '%' : 'n/a';
         const tags = `${p.launching ? ' [launching]' : ''}${p.sellIntent ? ' [sell pending]' : ''}`;
         return `${p.symbol} (${p.kind}) ${chg} / target +${limits(p).tp}%${tags}`;
       });
-      return tg(`Open positions:\n${out.join('\n')}`);
+      return tg(header + `Open positions:\n${out.join('\n')}`);
     }
 
     case '/balance': {
@@ -545,7 +652,7 @@ async function handleCommand(text, photoId) {
 
     default:
       return tg(
-        'Commands:\n/launch [Name SYMBOL] [image-url]\n/image <url> | /image off\n/addimages (links on next lines)\n/images\n/clearimages\n/names (list on next lines)\n/list\n/next [n]\n/clearnames\n/status\n/balance\n/sellall'
+        'Commands:\n/launch [Name SYMBOL] [image-url]\n/image <url> | /image off\n/addimages (links on next lines)\n/images\n/clearimages\n/names (list on next lines)\n/list\n/next [n]\n/clearnames\n/autopilot on|off\n/status\n/balance\n/sellall'
       );
   }
 }
@@ -979,6 +1086,7 @@ function resubscribe() {
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  stopAutoPilot();
   await tg(`Bot stopping (${signal}). ${positions.size} open position(s) are saved and will be restored on restart.`);
   const deadline = now() + 8000; // give an in-flight sell a few seconds to finish
   while ([...positions.values()].some((p) => p.closing) && now() < deadline) await sleep(200);
@@ -1008,11 +1116,13 @@ async function main() {
   if (CFG.devTakeProfitPct < 6) warns.push('devTakeProfitPct is below ~6%: fees can turn that into a loss');
   if (!TG_TOKEN || !TG_CHAT) warns.push('Telegram not configured: no alerts and no remote control');
 
+  const unusedNames = queue.filter((q) => !q.used).length;
   await tg(
     `Bot started\nwallet ${wallet}\nbalance ${await fmtBal(startBalance)}\n` +
       `dev buy ${CFG.devBuySol} SOL | sell at +${CFG.devTakeProfitPct}% / stop ${CFG.devStopLossPct > 0 ? '-' + CFG.devStopLossPct + '%' : 'off'} | storage ${usingSupabase() ? 'Supabase' : 'local files'}\n` +
-      `open positions ${positions.size} | names unused ${queue.filter((q) => !q.used).length} | image links ${imagePool().length}\n` +
-      `sniping: ${CFG.snipeOthers ? 'ON (' + CFG.buySol + ' SOL per buy)' : 'OFF'}` +
+      `open positions ${positions.size} | names unused ${unusedNames} | image links ${imagePool().length}\n` +
+      `sniping: ${CFG.snipeOthers ? 'ON (' + CFG.buySol + ' SOL per buy)' : 'OFF'}\n` +
+      `auto-pilot: interval ${CFG.autoIntervalSec}s | soft limit ${CFG.autoMaxConcurrent} concurrent | boot ${CFG.autoPilot ? 'ON' : 'OFF'}` +
       (warns.length ? `\n\nWarnings:\n- ${warns.join('\n- ')}` : '') +
       `\n\nSend /help for commands`
   );
@@ -1021,6 +1131,13 @@ async function main() {
   if (CFG.launchOnStart) {
     await sleep(2500);
     launchToken();
+  }
+  // Auto-start from env AUTO_PILOT=true if a names list already has unused entries
+  if (CFG.autoPilot && unusedNames > 0) {
+    startAutoPilot();
+    tg(`Auto-pilot started from env (AUTO_PILOT=true). Remaining: ${unusedNames}`);
+  } else if (CFG.autoPilot && unusedNames === 0) {
+    tg('AUTO_PILOT=true but names list is empty/all used. Load /names then /autopilot on.');
   }
 }
 
