@@ -1,9 +1,13 @@
 {
   "name": "supreme-robot",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "main": "pump-launcher-bot-v2.js",
-  "scripts": { "start": "node pump-launcher-bot-v2.js" },
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "test": "node test.js"
+  },
+  "engines": { "node": ">=18" },
   "dependencies": {
     "@solana/web3.js": "^1.95.0",
     "bs58": "^5.0.0",
