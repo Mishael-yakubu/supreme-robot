@@ -7,10 +7,16 @@
     "start": "node bot.js",
     "test": "node test.js"
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "@solana/web3.js": "^1.95.0",
     "bs58": "^5.0.0",
     "ws": "^8.18.0"
+  },
+  "overrides": {
+    "uuid": "9.0.1",
+    "rpc-websockets": "7.11.0"
   }
 }
