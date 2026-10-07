@@ -36,8 +36,11 @@ const CFG = {
   ipfsUrl: 'https://pump.fun/api/ipfs',
   rpc: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
 
-  slippagePct: 25,
-  priorityFeeSol: 0.001,
+  // ---- FEES / SLIPPAGE (lowered to keep costs down) ----
+  slippagePct: 25,              // used for sells and launches so they reliably land
+  snipeBuySlippagePct: 15,      // tighter on snipe buys (less sandwich exposure)
+  priorityFeeSol: 0.0002,       // launches and sells (was 0.001)
+  snipeBuyPriorityFeeSol: 0.0003, // snipe buys only; too low and you land late
   sellRetries: 5,
 
   // ---- DEFAULT TOKEN (used by plain /launch) ----
@@ -52,23 +55,24 @@ const CFG = {
   imagePath: './token.png',  // fallback image if none is given via Telegram
   maxImageBytes: 5 * 1024 * 1024,
   namesFile: './names.json', // keeps your daily list across restarts
-  devBuySol: 0.1,            // SOL spent on the dev buy of every launch
+  devBuySol: 0.06,           // SOL spent on the dev buy of every launch
 
-  // ---- LAUNCH CONTROL (unchanged) ----
+  // ---- LAUNCH CONTROL ----
   launchOnStart: false,
   maxLaunchesPerRun: 3,
   launchCooldownSec: 60,
 
-  // ---- SELL RULES FOR YOUR LAUNCHES (unchanged) ----
-  devTakeProfitPct: 30,      // keep above ~5% or fees eat the profit
-  devStopLossPct: 0,         // 0 = disabled
-  devMaxHoldSec: 0,          // 0 = disabled
+  // ---- SELL RULES FOR YOUR LAUNCHES ----
+  devTakeProfitPct: 50,      // keep above ~5% or fees eat the profit
+  devStopLossPct: 35,        // 0 = disabled
+  devMaxHoldSec: 300,        // sell after 5 min if target not hit (0 = disabled)
 
-  // ---- SNIPING OTHER LAUNCHES (OFF) ----
-  snipeOthers: false,
+  // ---- SNIPING OTHER LAUNCHES ----
+  // OFF by default. To turn on, set env SNIPE_OTHERS=true and restart the bot.
+  snipeOthers: process.env.SNIPE_OTHERS === 'true',
   minDevBuySol: 1,
   maxDevBuySol: 10,
-  buySol: 0.05,
+  buySol: 0.033,             // ~ $5 at $150/SOL. Recalculate from the current SOL price.
   snipeTakeProfitPct: 50,
   snipeStopLossPct: 25,
   snipeMaxHoldSec: 180,
@@ -100,7 +104,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const scan = (sig) => `https://solscan.io/tx/${sig}`;
 
 // ---------- names queue ----------
-
 function loadQueue() {
   try { queue = JSON.parse(fs.readFileSync(CFG.namesFile, 'utf8')); } catch { queue = []; }
 }
@@ -109,18 +112,15 @@ function saveQueue() {
     console.log('[names] save failed:', e.message);
   }
 }
-
 function validNameSymbol(name, symbol) {
   if (!name || name.length > 32) return 'Name must be 1-32 characters';
   if (!/^[A-Z0-9]{1,10}$/.test(symbol)) return 'Symbol must be 1-10 letters/numbers';
   return null;
 }
-
 function parseNameSymbol(tokens) {
   if (tokens.length < 2) return null;
   return { name: tokens.slice(0, -1).join(' '), symbol: tokens[tokens.length - 1].toUpperCase() };
 }
-
 function parseNames(lines) {
   const out = [];
   for (const line of lines) {
@@ -135,7 +135,6 @@ function parseNames(lines) {
 }
 
 // ---------- images ----------
-
 async function fetchImage(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`image download failed (${res.status})`);
@@ -158,7 +157,6 @@ async function telegramPhoto(fileId) {
 }
 
 const MIME = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
-
 function loadImageFile() {
   const ext = path.extname(CFG.imagePath).toLowerCase();
   if (!MIME[ext]) throw new Error('imagePath must be png, jpg, gif or webp');
@@ -169,7 +167,6 @@ function loadImageFile() {
 }
 
 // ---------- telegram ----------
-
 async function tg(text) {
   console.log(text.replace(/\n/g, ' | '));
   if (!TG_TOKEN || !TG_CHAT) return;
@@ -310,7 +307,6 @@ async function handleCommand(text, photoId) {
 }
 
 // ---------- execution ----------
-
 async function send(extra, extraSigners = []) {
   const res = await fetch(CFG.tradeUrl, {
     method: 'POST',
@@ -320,7 +316,7 @@ async function send(extra, extraSigners = []) {
       slippage: CFG.slippagePct,
       priorityFee: CFG.priorityFeeSol,
       pool: 'auto',
-      ...extra,
+      ...extra, // per-action overrides (slippage / priorityFee) win over the defaults above
     }),
   });
   if (res.status !== 200) throw new Error(`trade-local ${res.status}: ${await res.text()}`);
@@ -333,7 +329,12 @@ async function send(extra, extraSigners = []) {
 }
 
 const buyTx = (mint, amountSol) =>
-  send({ action: 'buy', mint, amount: amountSol, denominatedInSol: 'true' });
+  send({
+    action: 'buy', mint, amount: amountSol, denominatedInSol: 'true',
+    slippage: CFG.snipeBuySlippagePct,
+    priorityFee: CFG.snipeBuyPriorityFeeSol,
+  });
+
 const sellAllTx = (mint) =>
   send({ action: 'sell', mint, amount: '100%', denominatedInSol: 'false' });
 
@@ -357,10 +358,8 @@ async function checkSessionLoss() {
 }
 
 // ---------- token launch ----------
-
 async function uploadMetadata(tok) {
   const img = tok.image || defaultImage || loadImageFile();
-
   const form = new FormData();
   form.append('file', new Blob([img.buf], { type: img.mime }), img.filename);
   form.append('name', tok.name);
@@ -370,7 +369,6 @@ async function uploadMetadata(tok) {
   if (tok.telegram) form.append('telegram', tok.telegram);
   if (tok.website) form.append('website', tok.website);
   form.append('showName', 'true');
-
   const res = await fetch(CFG.ipfsUrl, { method: 'POST', body: form });
   if (!res.ok) throw new Error(`metadata upload ${res.status}: ${await res.text()}`);
   const j = await res.json();
@@ -395,10 +393,11 @@ async function launchToken(overrides = {}) {
 
   try {
     const bal = await getBalance();
-    if (bal < CFG.devBuySol + 0.05) {
+    // dev buy + ~0.02 SOL headroom for account rent and network/priority fees
+    if (bal < CFG.devBuySol + 0.02) {
       throw new Error(`balance ${sol(bal)} SOL too low for dev buy ${CFG.devBuySol} + fees`);
     }
-    await tg(`Launching ${tok.symbol} (${tok.name})\ndev buy ${CFG.devBuySol} SOL\nsell at +${CFG.devTakeProfitPct}%`);
+    await tg(`Launching ${tok.symbol} (${tok.name})\ndev buy ${CFG.devBuySol} SOL\nsell at +${CFG.devTakeProfitPct}% / stop -${CFG.devStopLossPct}%`);
 
     const uri = await uploadMetadata(tok);
 
@@ -444,12 +443,10 @@ async function launchToken(overrides = {}) {
 }
 
 // ---------- entries ----------
-
 function onOwnLaunch(t) {
   const mc = Number(t.marketCapSol || 0);
   if (!mc) return;
   const existing = positions.get(t.mint);
-
   if (existing) {
     if (existing.entryMc === null) {
       existing.entryMc = mc;
@@ -458,7 +455,6 @@ function onOwnLaunch(t) {
     }
     return;
   }
-
   // launched manually from the same wallet (pump.fun site/app)
   positions.set(t.mint, {
     kind: 'dev', mint: t.mint, symbol: t.symbol,
@@ -498,8 +494,7 @@ function onNewToken(t) {
   if (CFG.snipeOthers) return onOtherLaunch(t);
 }
 
-// ---------- exits (unchanged) ----------
-
+// ---------- exits ----------
 function limits(p) {
   return p.kind === 'dev'
     ? { tp: CFG.devTakeProfitPct, sl: CFG.devStopLossPct, hold: CFG.devMaxHoldSec }
@@ -510,17 +505,14 @@ function onTrade(t) {
   const p = positions.get(t.mint);
   if (!p || p.closing || p.launching || !t.marketCapSol) return;
   const mc = Number(t.marketCapSol);
-
   if (p.entryMc === null) {
     p.entryMc = mc;
     p.lastMc = mc;
     return;
   }
-
   p.lastMc = mc;
   const chg = (mc / p.entryMc - 1) * 100;
   const L = limits(p);
-
   if (chg >= L.tp) closePosition(p, `TAKE PROFIT ${sol(chg, 1)}%`);
   else if (L.sl > 0 && chg <= -L.sl) closePosition(p, `STOP LOSS ${sol(chg, 1)}%`);
 }
@@ -528,7 +520,6 @@ function onTrade(t) {
 async function closePosition(p, reason) {
   if (p.closing) return;
   p.closing = true;
-
   for (let i = 1; i <= CFG.sellRetries; i++) {
     try {
       const sig = await sellAllTx(p.mint);
@@ -560,21 +551,18 @@ setInterval(() => {
 }, 3000);
 
 // ---------- websocket ----------
-
 function sendWs(obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
 function connect() {
   ws = new WebSocket(CFG.wsUrl);
-
   ws.on('open', () => {
     console.log('[ws] connected');
     sendWs({ method: 'subscribeNewToken' });
     const keys = [...positions.keys()];
     if (keys.length) sendWs({ method: 'subscribeTokenTrade', keys });
   });
-
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
@@ -582,24 +570,22 @@ function connect() {
     if (msg.txType === 'create') onNewToken(msg);
     else if (positions.has(msg.mint)) onTrade(msg);
   });
-
   ws.on('close', () => {
     console.log('[ws] closed, reconnecting in 2s');
     setTimeout(connect, 2000);
   });
-
   ws.on('error', (e) => console.log('[ws] error:', e.message));
 }
 
 // ---------- start ----------
-
 (async () => {
   loadQueue();
   startBalance = await getBalance();
   connect();
   await tg(
     `Bot started\nwallet ${wallet}\nbalance ${sol(startBalance)} SOL\n` +
-      `dev buy ${CFG.devBuySol} SOL | sell at +${CFG.devTakeProfitPct}%\n` +
+      `dev buy ${CFG.devBuySol} SOL | sell at +${CFG.devTakeProfitPct}% / stop -${CFG.devStopLossPct}%\n` +
+      `sniping: ${CFG.snipeOthers ? 'ON (' + CFG.buySol + ' SOL per buy)' : 'OFF'}\n` +
       `names in list: ${queue.filter((q) => !q.used).length} unused\nSend /help for commands`
   );
   if (TG_TOKEN && TG_CHAT) tgPoll();
