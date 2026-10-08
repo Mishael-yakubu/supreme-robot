@@ -444,18 +444,53 @@ async function pickRandomImage() {
 
 // ---------- telegram ----------
 
-// Persistent reply keyboard — most-used commands as tappable buttons
+// Persistent bottom reply keyboard (always visible after first message)
+// style: success=green, primary=blue, danger=red (Bot API 9.4+ / clients after Feb 2026)
 const MAIN_KEYBOARD = {
   keyboard: [
-    [{ text: '/status' }, { text: '/balance' }, { text: '/settings' }],
-    [{ text: '/next' }, { text: '/list' }, { text: '/sellall' }],
-    [{ text: '/autopilot on' }, { text: '/autopilot off' }, { text: '/help' }],
+    [
+      { text: '/status', style: 'primary' },
+      { text: '/balance', style: 'primary' },
+      { text: '/settings', style: 'primary' },
+    ],
+    [
+      { text: '/next', style: 'success' },
+      { text: '/list', style: 'success' },
+      { text: '/sellall', style: 'danger' },
+    ],
+    [
+      { text: '/autopilot on', style: 'success' },
+      { text: '/autopilot off', style: 'danger' },
+      { text: '/help', style: 'primary' },
+    ],
   ],
   resize_keyboard: true,
   is_persistent: true,
 };
 
-async function tg(text, withKeyboard = false) {
+// Inline buttons under the message — green for actions, blue for info, red for sell/stop
+const INLINE_MENU = {
+  inline_keyboard: [
+    [
+      { text: '📊 Status', callback_data: 'cmd:/status', style: 'primary' },
+      { text: '💰 Balance', callback_data: 'cmd:/balance', style: 'primary' },
+      { text: '⚙️ Settings', callback_data: 'cmd:/settings', style: 'primary' },
+    ],
+    [
+      { text: '▶️ Next', callback_data: 'cmd:/next', style: 'success' },
+      { text: '📋 List', callback_data: 'cmd:/list', style: 'success' },
+      { text: '💸 Sell all', callback_data: 'cmd:/sellall', style: 'danger' },
+    ],
+    [
+      { text: '🤖 Autopilot ON', callback_data: 'cmd:/autopilot on', style: 'success' },
+      { text: '⏹ Autopilot OFF', callback_data: 'cmd:/autopilot off', style: 'danger' },
+    ],
+  ],
+};
+
+// withKeyboard: true  → bottom reply keyboard
+// withInline: true    → inline buttons under this message
+async function tg(text, withKeyboard = true, withInline = false) {
   console.log(String(text).replace(/\n/g, ' | '));
   if (!TG_TOKEN || !TG_CHAT) return;
   for (let i = 0; i < text.length; i += 3900) {
@@ -464,17 +499,36 @@ async function tg(text, withKeyboard = false) {
       text: text.slice(i, i + 3900),
       disable_web_page_preview: true,
     };
-    // Attach keyboard only on the first chunk to avoid spam
-    if (withKeyboard && i === 0) payload.reply_markup = MAIN_KEYBOARD;
+    if (i === 0) {
+      if (withInline) payload.reply_markup = INLINE_MENU;
+      else if (withKeyboard) payload.reply_markup = MAIN_KEYBOARD;
+    }
     try {
-      await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
+      if (!res.ok) {
+        const body = await res.text();
+        console.log('[tg] send failed:', res.status, body);
+      }
     } catch (e) {
       console.log('[tg] send failed:', e.message);
     }
+  }
+}
+
+async function tgAnswerCallback(id, notice = '') {
+  if (!TG_TOKEN) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: id, text: notice, show_alert: false }),
+    });
+  } catch (e) {
+    console.log('[tg] answerCallback failed:', e.message);
   }
 }
 
@@ -502,6 +556,19 @@ async function tgPoll() {
       }
       for (const u of j.result || []) {
         offset = u.update_id + 1;
+
+        // Inline button taps
+        if (u.callback_query) {
+          const cq = u.callback_query;
+          if (!cq.message || String(cq.message.chat.id) !== String(TG_CHAT)) continue;
+          const data = (cq.data || '').trim();
+          await tgAnswerCallback(cq.id);
+          if (data.startsWith('cmd:')) {
+            handleCommand(data.slice(4), null).catch((e) => tg(`Command error: ${e.message}`));
+          }
+          continue;
+        }
+
         const m = u.message;
         if (!m || String(m.chat.id) !== String(TG_CHAT)) continue;
         if (Date.now() / 1000 - m.date > 120) continue; // ignore stale messages
@@ -666,6 +733,7 @@ async function handleCommand(text, photoId) {
           `launch cap: ${launches}/${CFG.maxLaunchesPerRun} | cooldown ${CFG.launchCooldownSec}s\n` +
           `TP ${CFG.devTakeProfitPct}% | SL ${CFG.devStopLossPct > 0 ? CFG.devStopLossPct + '%' : 'off'} | max hold ${CFG.devMaxHoldSec || 'off'}s\n` +
           `Env: DEV_BUY_SOL / SNIPE_BUY_SOL / SNIPE_BUY_USD / SNIPE_OTHERS / AUTO_*`,
+        true,
         true
       );
     }
@@ -674,18 +742,18 @@ async function handleCommand(text, photoId) {
       const remaining = queue.filter((q) => !q.used).length;
       const header =
         `Auto-pilot: ${autoPilot ? 'ON' : 'OFF'} | launches ${launches}/${CFG.maxLaunchesPerRun} | names left ${remaining}\n`;
-      if (!positions.size) return tg(header + 'No open positions');
+      if (!positions.size) return tg(header + 'No open positions', true);
       const out = [...positions.values()].map((p) => {
         const chg = p.entryMc ? ((p.lastMc / p.entryMc - 1) * 100).toFixed(1) + '%' : 'n/a';
         const tags = `${p.launching ? ' [launching]' : ''}${p.sellIntent ? ' [sell pending]' : ''}`;
         return `${p.symbol} (${p.kind}) ${chg} / target +${limits(p).tp}%${tags}`;
       });
-      return tg(header + `Open positions:\n${out.join('\n')}`);
+      return tg(header + `Open positions:\n${out.join('\n')}`, true);
     }
 
     case '/balance': {
       const b = await ops.walletBalance();
-      return tg(`Wallet ${wallet}\n${await fmtBal(b)}`);
+      return tg(`Wallet ${wallet}\n${await fmtBal(b)}`, true);
     }
 
     case '/sellall': {
@@ -698,7 +766,8 @@ async function handleCommand(text, photoId) {
 
     default:
       return tg(
-        'Commands:\n/launch [Name SYMBOL] [image-url]\n/image <url> | /image off\n/addimages (links on next lines)\n/images\n/clearimages\n/names (list on next lines)\n/list\n/next [n]\n/clearnames\n/autopilot on|off\n/settings\n/status\n/balance\n/sellall\n\nTap the buttons below for quick actions.',
+        'Commands:\n/launch [Name SYMBOL] [image-url]\n/image <url> | /image off\n/addimages (links on next lines)\n/images\n/clearimages\n/names (list on next lines)\n/list\n/next [n]\n/clearnames\n/autopilot on|off\n/settings\n/status\n/balance\n/sellall\n\nUse the buttons below or the menu at the bottom.',
+        true,
         true
       );
   }
