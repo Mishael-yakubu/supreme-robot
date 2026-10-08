@@ -141,7 +141,7 @@ let autoTimer = null;
 
 const positions = new Map(); // mint -> position
 const pending = new Set();   // snipe buys in flight
-const saveChains = { names: Promise.resolve(), positions: Promise.resolve(), images: Promise.resolve() };
+const saveChains = { names: Promise.resolve(), positions: Promise.resolve(), images: Promise.resolve(), runtime: Promise.resolve() };
 
 const now = () => Date.now();
 const sol = (n, d = 4) => Number(n).toFixed(d);
@@ -234,6 +234,16 @@ const persistPositions = () =>
   );
 const persistNames = () => queueSave('names', () => queue);
 const persistImages = () => queueSave('images', () => images);
+const persistRuntime = () =>
+  queueSave('runtime', () => ({
+    devBuySol: CFG.devBuySol,
+    devTakeProfitPct: CFG.devTakeProfitPct,
+    devStopLossPct: CFG.devStopLossPct,
+    snipeOthers: CFG.snipeOthers,
+    buySol: CFG.buySol,
+    snipeBuyUsd: CFG.snipeBuyUsd,
+  }));
+
 
 async function loadState() {
   let saved = [];
@@ -254,6 +264,19 @@ async function loadState() {
     saved = Array.isArray(s) ? s : [];
   } catch (e) {
     tg(`WARNING: could not load open positions: ${e.message}. Check the wallet manually.`);
+  }
+  try {
+    const rt = await store.get('runtime');
+    if (rt && typeof rt === 'object') {
+      if (Number.isFinite(rt.devBuySol) && rt.devBuySol > 0) CFG.devBuySol = rt.devBuySol;
+      if (Number.isFinite(rt.devTakeProfitPct) && rt.devTakeProfitPct > 0) CFG.devTakeProfitPct = rt.devTakeProfitPct;
+      if (Number.isFinite(rt.devStopLossPct) && rt.devStopLossPct >= 0) CFG.devStopLossPct = rt.devStopLossPct;
+      if (typeof rt.snipeOthers === 'boolean') CFG.snipeOthers = rt.snipeOthers;
+      if (Number.isFinite(rt.buySol) && rt.buySol > 0) CFG.buySol = rt.buySol;
+      if (Number.isFinite(rt.snipeBuyUsd) && rt.snipeBuyUsd >= 0) CFG.snipeBuyUsd = rt.snipeBuyUsd;
+    }
+  } catch (e) {
+    console.log('[store] runtime load failed:', e.message);
   }
   return saved;
 }
@@ -488,6 +511,139 @@ const INLINE_MENU = {
   ],
 };
 
+function settingsKeyboard() {
+  const sn = CFG.snipeOthers;
+  return {
+    inline_keyboard: [
+      [
+        { text: `Dev buy: ${CFG.devBuySol} SOL`, callback_data: 'cfg:noop' },
+      ],
+      [
+        { text: '0.03', callback_data: 'cfg:devBuy:0.03', style: 'success' },
+        { text: '0.05', callback_data: 'cfg:devBuy:0.05', style: 'success' },
+        { text: '0.08', callback_data: 'cfg:devBuy:0.08', style: 'success' },
+        { text: '0.1', callback_data: 'cfg:devBuy:0.1', style: 'success' },
+      ],
+      [
+        { text: `TP: +${CFG.devTakeProfitPct}%`, callback_data: 'cfg:noop' },
+      ],
+      [
+        { text: '30%', callback_data: 'cfg:tp:30', style: 'primary' },
+        { text: '50%', callback_data: 'cfg:tp:50', style: 'primary' },
+        { text: '80%', callback_data: 'cfg:tp:80', style: 'primary' },
+        { text: '100%', callback_data: 'cfg:tp:100', style: 'primary' },
+      ],
+      [
+        { text: `SL: ${CFG.devStopLossPct > 0 ? '-' + CFG.devStopLossPct + '%' : 'off'}`, callback_data: 'cfg:noop' },
+      ],
+      [
+        { text: 'Off', callback_data: 'cfg:sl:0', style: 'danger' },
+        { text: '20%', callback_data: 'cfg:sl:20', style: 'danger' },
+        { text: '35%', callback_data: 'cfg:sl:35', style: 'danger' },
+        { text: '50%', callback_data: 'cfg:sl:50', style: 'danger' },
+      ],
+      [
+        { text: sn ? '🟢 Snipe: ON' : '🔴 Snipe: OFF', callback_data: 'cfg:snipe:toggle', style: sn ? 'success' : 'danger' },
+      ],
+      [
+        { text: 'Snipe $3', callback_data: 'cfg:snipeUsd:3', style: 'success' },
+        { text: 'Snipe $5', callback_data: 'cfg:snipeUsd:5', style: 'success' },
+        { text: 'Snipe $10', callback_data: 'cfg:snipeUsd:10', style: 'success' },
+      ],
+      [
+        { text: '📊 Status', callback_data: 'cmd:/status', style: 'primary' },
+        { text: '💰 Balance', callback_data: 'cmd:/balance', style: 'primary' },
+      ],
+    ],
+  };
+}
+
+async function settingsText() {
+  const price = await ops.solPrice();
+  let snipeLine;
+  if (CFG.snipeBuyUsd > 0) {
+    const est = price > 0 ? (CFG.snipeBuyUsd / price) : null;
+    snipeLine = `snipe size: $${CFG.snipeBuyUsd} USD` + (est ? ` (~${sol(est)} SOL)` : '');
+  } else {
+    snipeLine = `snipe size: ${CFG.buySol} SOL` + (price > 0 ? ` (~$${(CFG.buySol * price).toFixed(2)})` : '');
+  }
+  return (
+    `⚙️ Settings (tap to change)\n` +
+    `dev buy: ${CFG.devBuySol} SOL` + (price > 0 ? ` (~$${(CFG.devBuySol * price).toFixed(2)})` : '') + `\n` +
+    `TP +${CFG.devTakeProfitPct}% | SL ${CFG.devStopLossPct > 0 ? '-' + CFG.devStopLossPct + '%' : 'off'} | max hold ${CFG.devMaxHoldSec || 'off'}s\n` +
+    `sniping: ${CFG.snipeOthers ? 'ON' : 'OFF'} | ${snipeLine}\n` +
+    `auto-pilot: ${autoPilot ? 'ON' : 'OFF'} | interval ${CFG.autoIntervalSec}s | soft limit ${CFG.autoMaxConcurrent}\n` +
+    `launch cap: ${launches}/${CFG.maxLaunchesPerRun} | cooldown ${CFG.launchCooldownSec}s\n` +
+    `Changes save automatically and survive restart.`
+  );
+}
+
+async function applyConfig(data) {
+  // data like cfg:devBuy:0.05 | cfg:tp:50 | cfg:sl:0 | cfg:snipe:toggle | cfg:snipeUsd:5
+  const parts = data.split(':');
+  if (parts[0] !== 'cfg' || parts.length < 2) return null;
+  const key = parts[1];
+  const val = parts[2];
+
+  if (key === 'noop') return 'ok';
+
+  if (key === 'devBuy') {
+    const n = Number(val);
+    if (!(n > 0)) return null;
+    CFG.devBuySol = n;
+    await persistRuntime();
+    return `Dev buy set to ${n} SOL`;
+  }
+  if (key === 'tp') {
+    const n = Number(val);
+    if (!(n > 0)) return null;
+    CFG.devTakeProfitPct = n;
+    await persistRuntime();
+    return `Take profit set to +${n}%`;
+  }
+  if (key === 'sl') {
+    const n = Number(val);
+    if (!(n >= 0)) return null;
+    CFG.devStopLossPct = n;
+    await persistRuntime();
+    return n === 0 ? 'Stop loss disabled' : `Stop loss set to -${n}%`;
+  }
+  if (key === 'snipe' && val === 'toggle') {
+    CFG.snipeOthers = !CFG.snipeOthers;
+    await persistRuntime();
+    return `Sniping ${CFG.snipeOthers ? 'ON' : 'OFF'}`;
+  }
+  if (key === 'snipeUsd') {
+    const n = Number(val);
+    if (!(n > 0)) return null;
+    CFG.snipeBuyUsd = n;
+    await persistRuntime();
+    return `Snipe size set to $${n}`;
+  }
+  return null;
+}
+
+async function editSettingsMessage(chatId, messageId) {
+  if (!TG_TOKEN) return;
+  try {
+    const body = {
+      chat_id: chatId,
+      message_id: messageId,
+      text: await settingsText(),
+      reply_markup: settingsKeyboard(),
+      disable_web_page_preview: true,
+    };
+    const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/editMessageText`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) console.log('[tg] editSettings failed:', res.status, await res.text());
+  } catch (e) {
+    console.log('[tg] editSettings failed:', e.message);
+  }
+}
+
 // withKeyboard: true  → bottom reply keyboard
 // withInline: true    → inline buttons under this message
 async function tg(text, withKeyboard = true, withInline = false) {
@@ -562,9 +718,17 @@ async function tgPoll() {
           const cq = u.callback_query;
           if (!cq.message || String(cq.message.chat.id) !== String(TG_CHAT)) continue;
           const data = (cq.data || '').trim();
-          await tgAnswerCallback(cq.id);
-          if (data.startsWith('cmd:')) {
+          if (data.startsWith('cfg:')) {
+            const notice = await applyConfig(data);
+            await tgAnswerCallback(cq.id, notice || '');
+            if (notice && notice !== 'ok') {
+              await editSettingsMessage(cq.message.chat.id, cq.message.message_id);
+            }
+          } else if (data.startsWith('cmd:')) {
+            await tgAnswerCallback(cq.id);
             handleCommand(data.slice(4), null).catch((e) => tg(`Command error: ${e.message}`));
+          } else {
+            await tgAnswerCallback(cq.id);
           }
           continue;
         }
@@ -716,26 +880,28 @@ async function handleCommand(text, photoId) {
     }
 
     case '/settings': {
-      const price = await ops.solPrice();
-      let snipeLine;
-      if (CFG.snipeBuyUsd > 0) {
-        const est = price > 0 ? (CFG.snipeBuyUsd / price) : null;
-        snipeLine = `snipe size: $${CFG.snipeBuyUsd} USD` + (est ? ` (~${sol(est)} SOL @ $${price.toFixed(2)})` : ' (SOL price n/a)');
+      const msg = await settingsText();
+      // Direct send with settings keyboard (green/blue/red styles)
+      if (TG_TOKEN && TG_CHAT) {
+        try {
+          await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: TG_CHAT,
+              text: msg,
+              reply_markup: settingsKeyboard(),
+              disable_web_page_preview: true,
+            }),
+          });
+        } catch (e) {
+          console.log('[tg] settings send failed:', e.message);
+        }
       } else {
-        snipeLine = `snipe size: ${CFG.buySol} SOL` + (price > 0 ? ` (~$${(CFG.buySol * price).toFixed(2)})` : '');
+        console.log(msg.replace(/\n/g, ' | '));
       }
-      return tg(
-        `Settings\n` +
-          `dev buy: ${CFG.devBuySol} SOL` + (price > 0 ? ` (~$${(CFG.devBuySol * price).toFixed(2)})` : '') + `\n` +
-          `${snipeLine}\n` +
-          `sniping: ${CFG.snipeOthers ? 'ON' : 'OFF'}\n` +
-          `auto-pilot: ${autoPilot ? 'ON' : 'OFF'} | interval ${CFG.autoIntervalSec}s | soft limit ${CFG.autoMaxConcurrent}\n` +
-          `launch cap: ${launches}/${CFG.maxLaunchesPerRun} | cooldown ${CFG.launchCooldownSec}s\n` +
-          `TP ${CFG.devTakeProfitPct}% | SL ${CFG.devStopLossPct > 0 ? CFG.devStopLossPct + '%' : 'off'} | max hold ${CFG.devMaxHoldSec || 'off'}s\n` +
-          `Env: DEV_BUY_SOL / SNIPE_BUY_SOL / SNIPE_BUY_USD / SNIPE_OTHERS / AUTO_*`,
-        true,
-        true
-      );
+      // also refresh bottom keyboard
+      return tg('Settings panel above ↑', true, false);
     }
 
     case '/status': {
@@ -1220,7 +1386,7 @@ async function shutdown(signal) {
   await tg(`Bot stopping (${signal}). ${positions.size} open position(s) are saved and will be restored on restart.`);
   const deadline = now() + 8000; // give an in-flight sell a few seconds to finish
   while ([...positions.values()].some((p) => p.closing) && now() < deadline) await sleep(200);
-  await Promise.allSettled([saveChains.positions, saveChains.names, saveChains.images]);
+  await Promise.allSettled([saveChains.positions, saveChains.names, saveChains.images, saveChains.runtime]);
   process.exit(0);
 }
 
@@ -1287,6 +1453,6 @@ if (require.main === module) {
     pickRandomImage, parseUrls, imagePool, setImages: (a) => { images = a; }, getImages: () => images,
     onTrade, onOwnLaunch, closePosition, persistPositions, persistNames, persistImages, restorePositions,
     loadState, getConn: () => conn, getQueue: () => queue, setQueue: (q) => { queue = q; },
-    flush: () => Promise.all([saveChains.positions, saveChains.names, saveChains.images]),
+    flush: () => Promise.all([saveChains.positions, saveChains.names, saveChains.images, saveChains.runtime]),
   };
 }
