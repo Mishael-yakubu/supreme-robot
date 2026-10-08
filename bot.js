@@ -58,17 +58,26 @@ const CFG = {
   snipeBuySlippagePct: 15,       // snipe buys: tighter, less sandwich exposure
   snipeBuyPriorityFeeSol: 0.0003,
   // Sells: these are the FIRST attempt. Each retry raises both so a failing exit still lands.
-  sellSlippagePct: 25,           // retry n uses 25 + 10*(n-1), capped at sellSlippageMaxPct
+  sellSlippagePct: 30,           // retry n uses base + step*(n-1), capped at max
   sellSlippageStepPct: 10,
-  sellSlippageMaxPct: 50,
-  sellPriorityFeeSol: 0.0002,    // retry n uses 0.0002 * n
-  sellRetries: 5,                // attempts per sell round
-  sellConfirmTimeoutMs: 8000,    // low fees can land slowly, so escalate after 8s
+  sellSlippageMaxPct: 55,
+  sellPriorityFeeSol: 0.0003,    // retry n uses base * n
+  sellRetries: 6,                // attempts per sell round
+  sellConfirmTimeoutMs: 10000,   // low fees can land slowly
   buyConfirmTimeoutMs: 15000,
   createConfirmTimeoutMs: 30000,
-  rebroadcastMs: 1200,         // re-send the same signed tx until it lands
-  maxFailedSellRounds: 3,      // rounds of retries before giving up and alerting
-  sellRoundPauseMs: 10000,
+  rebroadcastMs: 1000,           // re-send the same signed tx until it lands
+  maxFailedSellRounds: 5,        // rounds of retries before giving up (dev)
+  sellRoundPauseMs: 6000,
+  // Snipe exits are more aggressive — pump.fun snipes move fast and need looser slippage
+  snipeSellSlippagePct: 40,
+  snipeSellSlippageStepPct: 10,
+  snipeSellSlippageMaxPct: 65,
+  snipeSellPriorityFeeSol: 0.0006,
+  snipeSellRetries: 8,
+  snipeSellConfirmTimeoutMs: 12000,
+  snipeMaxFailedSellRounds: 12,  // keep hammering; do not give up quickly on snipes
+  snipeSellRoundPauseMs: 4000,
 
   // ---- default token (plain /launch) ----
   token: {
@@ -989,16 +998,33 @@ const buyTx = (mint, amountSol) =>
   });
 
 // sells use a looser slippage and a higher priority fee that grows with each attempt
-const sellAllTx = (mint, attempt = 1) =>
-  send(
+// kind: 'dev' | 'snipe' — snipes use more aggressive params
+function sellParams(kind, attempt = 1) {
+  const snipe = kind === 'snipe';
+  const baseSlip = snipe ? CFG.snipeSellSlippagePct : CFG.sellSlippagePct;
+  const stepSlip = snipe ? CFG.snipeSellSlippageStepPct : CFG.sellSlippageStepPct;
+  const maxSlip = snipe ? CFG.snipeSellSlippageMaxPct : CFG.sellSlippageMaxPct;
+  const baseFee = snipe ? CFG.snipeSellPriorityFeeSol : CFG.sellPriorityFeeSol;
+  const timeout = snipe ? CFG.snipeSellConfirmTimeoutMs : CFG.sellConfirmTimeoutMs;
+  return {
+    slippage: Math.min(baseSlip + stepSlip * (attempt - 1), maxSlip),
+    priorityFee: baseFee * attempt,
+    timeoutMs: timeout,
+  };
+}
+
+const sellAllTx = (mint, attempt = 1, kind = 'dev') => {
+  const p = sellParams(kind, attempt);
+  return send(
     {
       action: 'sell', mint, amount: '100%', denominatedInSol: 'false',
-      slippage: Math.min(CFG.sellSlippagePct + CFG.sellSlippageStepPct * (attempt - 1), CFG.sellSlippageMaxPct),
-      priorityFee: CFG.sellPriorityFeeSol * attempt,
+      slippage: p.slippage,
+      priorityFee: p.priorityFee,
     },
     [],
-    CFG.sellConfirmTimeoutMs
+    p.timeoutMs
   );
+};
 
 async function getBalance() {
   return (await conn.getBalance(kp.publicKey)) / 1e9;
@@ -1060,7 +1086,7 @@ async function tokenBalance(mint) {
 
 // indirection so the self-test can replace the network calls
 const ops = {
-  sell: (mint, attempt) => sellAllTx(mint, attempt),
+  sell: (mint, attempt, kind) => sellAllTx(mint, attempt, kind),
   tokenBalance: (mint) => tokenBalance(mint),
   walletBalance: () => getBalance(),
   solPrice: () => getSolUsd(),
@@ -1220,9 +1246,10 @@ async function onOtherLaunch(t) {
   try {
     const snipeSol = await getSnipeBuySol();
     const sig = await buyTx(t.mint, snipeSol);
+    // entryMc null → first post-buy trade becomes the TP/SL baseline (more accurate than create-event mc)
     positions.set(t.mint, {
       kind: 'snipe', mint: t.mint, symbol: t.symbol,
-      entryMc: Number(t.marketCapSol), lastMc: Number(t.marketCapSol),
+      entryMc: null, lastMc: Number(t.marketCapSol) || 0,
       openedAt: now(), closing: false, launching: false,
     });
     persistPositions();
@@ -1287,24 +1314,50 @@ async function closePosition(p, reason) {
   p.closing = true;
   p.sellIntent = null;
   const t0 = now();
-  tg(`${reason}: selling ${p.symbol} now`); // not awaited on purpose, the sell must not wait on Telegram
+  const isSnipe = p.kind === 'snipe';
+  const retries = isSnipe ? CFG.snipeSellRetries : CFG.sellRetries;
+  const maxRounds = isSnipe ? CFG.snipeMaxFailedSellRounds : CFG.maxFailedSellRounds;
+  const pauseMs = isSnipe ? CFG.snipeSellRoundPauseMs : CFG.sellRoundPauseMs;
+  tg(`${reason}: selling ${p.symbol} (${p.kind}) now`); // not awaited — sell must not wait on Telegram
 
-  for (let i = 1; i <= CFG.sellRetries; i++) {
+  // already flat?
+  try {
+    if ((await ops.tokenBalance(p.mint)) <= 0) return finishSell(p, reason, null, t0);
+  } catch { /* continue into sell attempts */ }
+
+  for (let i = 1; i <= retries; i++) {
     try {
-      const sig = await ops.sell(p.mint, i);
-      return finishSell(p, reason, sig, t0);
+      const sig = await ops.sell(p.mint, i, p.kind);
+      // confirm tokens actually left the wallet (slow land / partial)
+      await sleep(400);
+      try {
+        if ((await ops.tokenBalance(p.mint)) <= 0) return finishSell(p, reason, sig, t0);
+        console.log(`[SELL] ${p.symbol} tx landed but balance still > 0, retrying`);
+      } catch {
+        return finishSell(p, reason, sig, t0); // assume sold if balance check fails after success
+      }
     } catch (e) {
-      console.log(`[SELL FAIL ${i}/${CFG.sellRetries}] ${p.symbol}: ${e.message}`);
-      // an earlier attempt may have landed late: if the tokens are gone, it sold
+      console.log(`[SELL FAIL ${i}/${retries}] ${p.symbol} (${p.kind}): ${e.message}`);
       try {
         if ((await ops.tokenBalance(p.mint)) <= 0) return finishSell(p, reason, null, t0);
       } catch { /* RPC hiccup, keep retrying */ }
-      await sleep(300);
+      await sleep(isSnipe ? 200 : 300);
     }
   }
 
   p.failRounds = (p.failRounds || 0) + 1;
-  if (p.failRounds >= CFG.maxFailedSellRounds) {
+  if (p.failRounds >= maxRounds) {
+    // last-ditch: one more max-slippage attempt before giving up
+    try {
+      const sig = await ops.sell(p.mint, retries + 2, p.kind);
+      await sleep(500);
+      if ((await ops.tokenBalance(p.mint)) <= 0) return finishSell(p, reason + ' (last ditch)', sig, t0);
+    } catch (e) {
+      console.log(`[SELL LAST DITCH FAIL] ${p.symbol}: ${e.message}`);
+      try {
+        if ((await ops.tokenBalance(p.mint)) <= 0) return finishSell(p, reason, null, t0);
+      } catch { /* ignore */ }
+    }
     positions.delete(p.mint);
     sendWs({ method: 'unsubscribeTokenTrade', keys: [p.mint] });
     persistPositions();
@@ -1312,21 +1365,36 @@ async function closePosition(p, reason) {
   } else {
     p.closing = false;
     p.sellIntent = reason;
-    p.retryAfter = now() + CFG.sellRoundPauseMs;
-    tg(`SELL FAILED for ${p.symbol} (round ${p.failRounds}/${CFG.maxFailedSellRounds}), retrying in ${CFG.sellRoundPauseMs / 1000}s`);
+    p.retryAfter = now() + pauseMs;
+    tg(`SELL FAILED for ${p.symbol} (round ${p.failRounds}/${maxRounds}), retrying in ${pauseMs / 1000}s`);
   }
 }
 
-// runs every few seconds: time limits, and retries for sells that failed
+// runs every few seconds: time limits, TP/SL from last known mc, and retries for failed sells
 function tick() {
   for (const p of [...positions.values()]) {
     if (p.closing || p.launching) continue;
+
+    // queued retry after a failed sell round
     if (p.sellIntent) {
       if (now() >= (p.retryAfter || 0)) closePosition(p, p.sellIntent);
       continue;
     }
-    const { hold } = limits(p);
-    if (hold > 0 && (now() - p.openedAt) / 1000 >= hold) closePosition(p, 'TIME LIMIT');
+
+    const L = limits(p);
+
+    // max hold timer
+    if (L.hold > 0 && (now() - p.openedAt) / 1000 >= L.hold) {
+      closePosition(p, 'TIME LIMIT');
+      continue;
+    }
+
+    // backup TP/SL using last known market cap (in case WS trade events were missed)
+    if (p.entryMc && p.lastMc) {
+      const chg = (p.lastMc / p.entryMc - 1) * 100;
+      if (chg >= L.tp - 1e-9) closePosition(p, `TAKE PROFIT ${sol(chg, 1)}% (tick)`);
+      else if (L.sl > 0 && chg <= -L.sl) closePosition(p, `STOP LOSS ${sol(chg, 1)}% (tick)`);
+    }
   }
 }
 
