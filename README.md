@@ -40,3 +40,11 @@ added with `/addimages`), then the file at `CFG.imagePath`. Use images you have 
 Edit the `CFG` block at the top of `bot.js`: dev buy size, profit target, stop loss, hold limit,
 slippage and priority fees, launch cap and cooldown. Sell slippage and fee in `CFG` are the first
 attempt; every retry raises both (slippage +10% up to 50%, fee x attempt number).
+
+## Sniping (off by default; `SNIPE_OTHERS=true` or the Settings button turns it on)
+- Entry filters: the dev buy must be inside `minDevBuySol`..`maxDevBuySol`, and the launch market
+  cap (SOL price x market cap in SOL) must be at least `snipeMinMcUsd` (default $4,000; env
+  `SNIPE_MIN_MC_USD`, `0` = off) and, if set, at most `snipeMaxMcUsd` (env `SNIPE_MAX_MC_USD`).
+  If the SOL price can't be fetched, the snipe is skipped.
+- Exits are automatic: take profit and stop loss sell 100% the moment the threshold is crossed,
+  and every snipe is force-sold at `snipeMaxHoldSec` (90s), checked every second.

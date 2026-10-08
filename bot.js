@@ -124,7 +124,12 @@ const CFG = {
   snipeBuyUsd: process.env.SNIPE_BUY_USD ? Math.max(0.5, Number(process.env.SNIPE_BUY_USD)) : 0,
   snipeTakeProfitPct: 50,
   snipeStopLossPct: 25,
-  snipeMaxHoldSec: 180,
+  snipeMaxHoldSec: 90,     // every snipe is force-sold at 90s (checked every second); selling itself takes a few more seconds
+  // Market-cap filter for snipes, in USD at the moment of the launch event (SOL price x market cap in SOL).
+  // New coins start around 28 SOL, so a $4k floor mostly screens out dumped or odd launches.
+  // Env: SNIPE_MIN_MC_USD / SNIPE_MAX_MC_USD (0 = no limit). Also adjustable from the /settings buttons.
+  snipeMinMcUsd: process.env.SNIPE_MIN_MC_USD !== undefined ? Math.max(0, Number(process.env.SNIPE_MIN_MC_USD) || 0) : 4000,
+  snipeMaxMcUsd: Math.max(0, Number(process.env.SNIPE_MAX_MC_USD) || 0),
   maxOpenSnipes: 5,
   maxSessionLossSol: 0.3,
 };
@@ -251,6 +256,8 @@ const persistRuntime = () =>
     snipeOthers: CFG.snipeOthers,
     buySol: CFG.buySol,
     snipeBuyUsd: CFG.snipeBuyUsd,
+    snipeMinMcUsd: CFG.snipeMinMcUsd,
+    snipeMaxMcUsd: CFG.snipeMaxMcUsd,
   }));
 
 
@@ -283,6 +290,8 @@ async function loadState() {
       if (typeof rt.snipeOthers === 'boolean') CFG.snipeOthers = rt.snipeOthers;
       if (Number.isFinite(rt.buySol) && rt.buySol > 0) CFG.buySol = rt.buySol;
       if (Number.isFinite(rt.snipeBuyUsd) && rt.snipeBuyUsd >= 0) CFG.snipeBuyUsd = rt.snipeBuyUsd;
+      if (Number.isFinite(rt.snipeMinMcUsd) && rt.snipeMinMcUsd >= 0) CFG.snipeMinMcUsd = rt.snipeMinMcUsd;
+      if (Number.isFinite(rt.snipeMaxMcUsd) && rt.snipeMaxMcUsd >= 0) CFG.snipeMaxMcUsd = rt.snipeMaxMcUsd;
     }
   } catch (e) {
     console.log('[store] runtime load failed:', e.message);
@@ -560,6 +569,15 @@ function settingsKeyboard() {
         { text: 'Snipe $10', callback_data: 'cfg:snipeUsd:10', style: 'success' },
       ],
       [
+        { text: `Snipe min mc: ${CFG.snipeMinMcUsd > 0 ? '$' + CFG.snipeMinMcUsd : 'off'}`, callback_data: 'cfg:noop' },
+      ],
+      [
+        { text: 'Off', callback_data: 'cfg:snipeMinMc:0', style: 'danger' },
+        { text: '$4k', callback_data: 'cfg:snipeMinMc:4000', style: 'primary' },
+        { text: '$5k', callback_data: 'cfg:snipeMinMc:5000', style: 'primary' },
+        { text: '$7k', callback_data: 'cfg:snipeMinMc:7000', style: 'primary' },
+      ],
+      [
         { text: '📊 Status', callback_data: 'cmd:/status', style: 'primary' },
         { text: '💰 Balance', callback_data: 'cmd:/balance', style: 'primary' },
       ],
@@ -581,6 +599,7 @@ async function settingsText() {
     `dev buy: ${CFG.devBuySol} SOL` + (price > 0 ? ` (~$${(CFG.devBuySol * price).toFixed(2)})` : '') + `\n` +
     `TP +${CFG.devTakeProfitPct}% | SL ${CFG.devStopLossPct > 0 ? '-' + CFG.devStopLossPct + '%' : 'off'} | max hold ${CFG.devMaxHoldSec || 'off'}s\n` +
     `sniping: ${CFG.snipeOthers ? 'ON' : 'OFF'} | ${snipeLine}\n` +
+    `snipe mc filter: min ${CFG.snipeMinMcUsd > 0 ? '$' + CFG.snipeMinMcUsd : 'off'}${CFG.snipeMaxMcUsd > 0 ? ' / max $' + CFG.snipeMaxMcUsd : ''} | snipes close within ${CFG.snipeMaxHoldSec}s\n` +
     `auto-pilot: ${autoPilot ? 'ON' : 'OFF'} | interval ${CFG.autoIntervalSec}s | soft limit ${CFG.autoMaxConcurrent}\n` +
     `launch cap: ${launches}/${CFG.maxLaunchesPerRun} | cooldown ${CFG.launchCooldownSec}s\n` +
     `Changes save automatically and survive restart.`
@@ -628,6 +647,13 @@ async function applyConfig(data) {
     CFG.snipeBuyUsd = n;
     await persistRuntime();
     return `Snipe size set to $${n}`;
+  }
+  if (key === 'snipeMinMc') {
+    const n = Number(val);
+    if (!(n >= 0)) return null;
+    CFG.snipeMinMcUsd = n;
+    await persistRuntime();
+    return n === 0 ? 'Snipe market-cap filter off' : `Snipes now need a launch market cap of at least $${n}`;
   }
   return null;
 }
@@ -1065,6 +1091,19 @@ async function fmtBal(bal) {
   return `${sol(bal)} SOL ($${dollars})`;
 }
 
+// Market-cap gate for snipes. Fails closed: if the SOL price is unknown the snipe is skipped.
+async function snipeMcCheck(mcSol) {
+  const min = CFG.snipeMinMcUsd;
+  const max = CFG.snipeMaxMcUsd;
+  if (!(min > 0) && !(max > 0)) return { ok: true };
+  const price = await ops.solPrice();
+  if (!(price > 0)) return { ok: false, reason: 'SOL price unavailable, cannot check market cap' };
+  const usd = mcSol * price;
+  if (min > 0 && usd < min) return { ok: false, reason: `market cap $${Math.round(usd)} is below the $${min} minimum` };
+  if (max > 0 && usd > max) return { ok: false, reason: `market cap $${Math.round(usd)} is above the $${max} maximum` };
+  return { ok: true, usd };
+}
+
 // Resolve snipe size: SNIPE_BUY_USD (live SOL price) wins over SNIPE_BUY_SOL / CFG.buySol
 async function getSnipeBuySol() {
   if (CFG.snipeBuyUsd > 0) {
@@ -1090,6 +1129,7 @@ const ops = {
   tokenBalance: (mint) => tokenBalance(mint),
   walletBalance: () => getBalance(),
   solPrice: () => getSolUsd(),
+  buy: (mint, amountSol) => buyTx(mint, amountSol),
 };
 
 async function checkSessionLoss() {
@@ -1239,13 +1279,20 @@ async function onOtherLaunch(t) {
   if (halted || shuttingDown) return;
   if (dev < CFG.minDevBuySol || dev > CFG.maxDevBuySol) return;
   if (!t.marketCapSol) return;
+
+  const gate = await snipeMcCheck(Number(t.marketCapSol));
+  if (!gate.ok) {
+    console.log(`[snipe skip] ${t.symbol}: ${gate.reason}`);
+    return;
+  }
+  // capacity check and reservation stay together (no await in between) so two launches cannot both slip in
   if (positions.size + pending.size >= CFG.maxOpenSnipes) return;
   if (positions.has(t.mint) || pending.has(t.mint)) return;
 
   pending.add(t.mint);
   try {
     const snipeSol = await getSnipeBuySol();
-    const sig = await buyTx(t.mint, snipeSol);
+    const sig = await ops.buy(t.mint, snipeSol);
     // entryMc null → first post-buy trade becomes the TP/SL baseline (more accurate than create-event mc)
     positions.set(t.mint, {
       kind: 'snipe', mint: t.mint, symbol: t.symbol,
@@ -1470,7 +1517,7 @@ async function main() {
   await restorePositions(saved);
 
   connect();
-  setInterval(tick, 3000);
+  setInterval(tick, 1000);
   setInterval(watchdog, 10000);
   setInterval(resubscribe, 60000);
 
@@ -1519,7 +1566,7 @@ if (require.main === module) {
     CFG, init, positions, ops, store, sellAllTx, buyTx, parseNames, validNameSymbol, landTx, tick,
     fmtBal, getSolUsd, resetSolPrice: () => { solPriceCache = { price: 0, at: 0 }; },
     pickRandomImage, parseUrls, imagePool, setImages: (a) => { images = a; }, getImages: () => images,
-    onTrade, onOwnLaunch, closePosition, persistPositions, persistNames, persistImages, restorePositions,
+    onTrade, onOwnLaunch, onNewToken, onOtherLaunch, snipeMcCheck, sellParams, closePosition, persistPositions, persistNames, persistImages, persistRuntime, restorePositions,
     loadState, getConn: () => conn, getQueue: () => queue, setQueue: (q) => { queue = q; },
     flush: () => Promise.all([saveChains.positions, saveChains.names, saveChains.images, saveChains.runtime]),
   };
