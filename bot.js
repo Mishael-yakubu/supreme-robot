@@ -18,6 +18,7 @@
 //   /addimages  (then public image links, one per line)  /images  /clearimages
 //   /image off                          clear the default image
 //   /autopilot on|off                   auto-advance the names list at intervals
+//   /settings                           show buy sizes, sniping, auto-pilot config
 //   /status  /balance  /sellall  /help
 //
 // Env vars
@@ -28,6 +29,9 @@
 //   SUPABASE_URL          optional, e.g. https://xxxx.supabase.co
 //   SUPABASE_SERVICE_KEY  optional, server-side secret key (never commit it)
 //   SNIPE_OTHERS          optional, set to true to turn on sniping other launches (off by default)
+//   DEV_BUY_SOL           optional, SOL spent on each of your launches (default 0.06)
+//   SNIPE_BUY_SOL         optional, SOL per snipe buy (default 0.033)
+//   SNIPE_BUY_USD         optional, dollar size per snipe; overrides SNIPE_BUY_SOL when set
 //   AUTO_PILOT            optional, set to true to start auto-pilot on boot (still needs a /names list)
 //   AUTO_INTERVAL_SEC     optional, seconds between auto launches (default 90)
 //   AUTO_MAX_CONCURRENT   optional, soft open-position limit while auto-pilot runs (default 5)
@@ -81,7 +85,7 @@ const CFG = {
   // An image attached to /launch or set with /image always wins. Add more with /addimages.
   // Only use images you have the right to use.
   imageUrls: ['https://picsum.photos/512'],
-  devBuySol: 0.06,
+  devBuySol: Math.max(0.001, Number(process.env.DEV_BUY_SOL) || 0.06),
 
   // ---- launch control ----
   launchOnStart: false,
@@ -106,7 +110,9 @@ const CFG = {
   snipeOthers: process.env.SNIPE_OTHERS === 'true',
   minDevBuySol: 1,
   maxDevBuySol: 10,
-  buySol: 0.033,           // about $5 at $150/SOL; recalculate from the current SOL price
+  // SNIPE_BUY_USD (dollars) wins over SNIPE_BUY_SOL when set; converted at buy time via live SOL price
+  buySol: Math.max(0.001, Number(process.env.SNIPE_BUY_SOL) || 0.033),
+  snipeBuyUsd: process.env.SNIPE_BUY_USD ? Math.max(0.5, Number(process.env.SNIPE_BUY_USD)) : 0,
   snipeTakeProfitPct: 50,
   snipeStopLossPct: 25,
   snipeMaxHoldSec: 180,
@@ -438,15 +444,33 @@ async function pickRandomImage() {
 
 // ---------- telegram ----------
 
-async function tg(text) {
+// Persistent reply keyboard — most-used commands as tappable buttons
+const MAIN_KEYBOARD = {
+  keyboard: [
+    [{ text: '/status' }, { text: '/balance' }, { text: '/settings' }],
+    [{ text: '/next' }, { text: '/list' }, { text: '/sellall' }],
+    [{ text: '/autopilot on' }, { text: '/autopilot off' }, { text: '/help' }],
+  ],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+
+async function tg(text, withKeyboard = false) {
   console.log(String(text).replace(/\n/g, ' | '));
   if (!TG_TOKEN || !TG_CHAT) return;
   for (let i = 0; i < text.length; i += 3900) {
+    const payload = {
+      chat_id: TG_CHAT,
+      text: text.slice(i, i + 3900),
+      disable_web_page_preview: true,
+    };
+    // Attach keyboard only on the first chunk to avoid spam
+    if (withKeyboard && i === 0) payload.reply_markup = MAIN_KEYBOARD;
     try {
       await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: TG_CHAT, text: text.slice(i, i + 3900), disable_web_page_preview: true }),
+        body: JSON.stringify(payload),
       });
     } catch (e) {
       console.log('[tg] send failed:', e.message);
@@ -624,6 +648,28 @@ async function handleCommand(text, photoId) {
       return;
     }
 
+    case '/settings': {
+      const price = await ops.solPrice();
+      let snipeLine;
+      if (CFG.snipeBuyUsd > 0) {
+        const est = price > 0 ? (CFG.snipeBuyUsd / price) : null;
+        snipeLine = `snipe size: $${CFG.snipeBuyUsd} USD` + (est ? ` (~${sol(est)} SOL @ $${price.toFixed(2)})` : ' (SOL price n/a)');
+      } else {
+        snipeLine = `snipe size: ${CFG.buySol} SOL` + (price > 0 ? ` (~$${(CFG.buySol * price).toFixed(2)})` : '');
+      }
+      return tg(
+        `Settings\n` +
+          `dev buy: ${CFG.devBuySol} SOL` + (price > 0 ? ` (~$${(CFG.devBuySol * price).toFixed(2)})` : '') + `\n` +
+          `${snipeLine}\n` +
+          `sniping: ${CFG.snipeOthers ? 'ON' : 'OFF'}\n` +
+          `auto-pilot: ${autoPilot ? 'ON' : 'OFF'} | interval ${CFG.autoIntervalSec}s | soft limit ${CFG.autoMaxConcurrent}\n` +
+          `launch cap: ${launches}/${CFG.maxLaunchesPerRun} | cooldown ${CFG.launchCooldownSec}s\n` +
+          `TP ${CFG.devTakeProfitPct}% | SL ${CFG.devStopLossPct > 0 ? CFG.devStopLossPct + '%' : 'off'} | max hold ${CFG.devMaxHoldSec || 'off'}s\n` +
+          `Env: DEV_BUY_SOL / SNIPE_BUY_SOL / SNIPE_BUY_USD / SNIPE_OTHERS / AUTO_*`,
+        true
+      );
+    }
+
     case '/status': {
       const remaining = queue.filter((q) => !q.used).length;
       const header =
@@ -652,7 +698,8 @@ async function handleCommand(text, photoId) {
 
     default:
       return tg(
-        'Commands:\n/launch [Name SYMBOL] [image-url]\n/image <url> | /image off\n/addimages (links on next lines)\n/images\n/clearimages\n/names (list on next lines)\n/list\n/next [n]\n/clearnames\n/autopilot on|off\n/status\n/balance\n/sellall'
+        'Commands:\n/launch [Name SYMBOL] [image-url]\n/image <url> | /image off\n/addimages (links on next lines)\n/images\n/clearimages\n/names (list on next lines)\n/list\n/next [n]\n/clearnames\n/autopilot on|off\n/settings\n/status\n/balance\n/sellall\n\nTap the buttons below for quick actions.',
+        true
       );
   }
 }
@@ -755,6 +802,18 @@ async function fmtBal(bal) {
   if (!(usd > 0)) return `${sol(bal)} SOL`;
   const dollars = (bal * usd).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return `${sol(bal)} SOL ($${dollars})`;
+}
+
+// Resolve snipe size: SNIPE_BUY_USD (live SOL price) wins over SNIPE_BUY_SOL / CFG.buySol
+async function getSnipeBuySol() {
+  if (CFG.snipeBuyUsd > 0) {
+    const price = await ops.solPrice();
+    if (!(price > 0)) throw new Error('cannot convert SNIPE_BUY_USD: SOL price unavailable');
+    const amount = CFG.snipeBuyUsd / price;
+    if (amount < 0.001) throw new Error(`SNIPE_BUY_USD $${CFG.snipeBuyUsd} is too small at current SOL price`);
+    return amount;
+  }
+  return CFG.buySol;
 }
 
 async function tokenBalance(mint) {
@@ -924,7 +983,8 @@ async function onOtherLaunch(t) {
 
   pending.add(t.mint);
   try {
-    const sig = await buyTx(t.mint, CFG.buySol);
+    const snipeSol = await getSnipeBuySol();
+    const sig = await buyTx(t.mint, snipeSol);
     positions.set(t.mint, {
       kind: 'snipe', mint: t.mint, symbol: t.symbol,
       entryMc: Number(t.marketCapSol), lastMc: Number(t.marketCapSol),
@@ -932,7 +992,8 @@ async function onOtherLaunch(t) {
     });
     persistPositions();
     sendWs({ method: 'subscribeTokenTrade', keys: [t.mint] });
-    tg(`SNIPE BUY ${t.symbol}\n${CFG.buySol} SOL @ mc ${sol(t.marketCapSol, 1)}\n${scan(sig)}`);
+    const usdNote = CFG.snipeBuyUsd > 0 ? ` (~$${CFG.snipeBuyUsd})` : '';
+    tg(`SNIPE BUY ${t.symbol}\n${sol(snipeSol)} SOL${usdNote} @ mc ${sol(t.marketCapSol, 1)}\n${scan(sig)}`);
   } catch (e) {
     tg(`SNIPE BUY FAILED ${t.symbol}\n${e.message}`);
   } finally {
@@ -1117,14 +1178,18 @@ async function main() {
   if (!TG_TOKEN || !TG_CHAT) warns.push('Telegram not configured: no alerts and no remote control');
 
   const unusedNames = queue.filter((q) => !q.used).length;
+  const snipeSizeNote = CFG.snipeBuyUsd > 0
+    ? `$${CFG.snipeBuyUsd}/snipe`
+    : `${CFG.buySol} SOL/snipe`;
   await tg(
     `Bot started\nwallet ${wallet}\nbalance ${await fmtBal(startBalance)}\n` +
       `dev buy ${CFG.devBuySol} SOL | sell at +${CFG.devTakeProfitPct}% / stop ${CFG.devStopLossPct > 0 ? '-' + CFG.devStopLossPct + '%' : 'off'} | storage ${usingSupabase() ? 'Supabase' : 'local files'}\n` +
       `open positions ${positions.size} | names unused ${unusedNames} | image links ${imagePool().length}\n` +
-      `sniping: ${CFG.snipeOthers ? 'ON (' + CFG.buySol + ' SOL per buy)' : 'OFF'}\n` +
+      `sniping: ${CFG.snipeOthers ? 'ON (' + snipeSizeNote + ')' : 'OFF'}\n` +
       `auto-pilot: interval ${CFG.autoIntervalSec}s | soft limit ${CFG.autoMaxConcurrent} concurrent | boot ${CFG.autoPilot ? 'ON' : 'OFF'}` +
       (warns.length ? `\n\nWarnings:\n- ${warns.join('\n- ')}` : '') +
-      `\n\nSend /help for commands`
+      `\n\nTap the buttons below or send /help`,
+    true
   );
 
   if (TG_TOKEN && TG_CHAT) tgPoll();
